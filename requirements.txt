@@ -1,13 +1,9 @@
 streamlit
-openai
 pandas
 numpy
-scikit-learn
 matplotlib
 beautifulsoup4
+openai
+scikit-learn
 fpdf
-seaborn 
-io
-re
-TSNE
-cosine_similarity
+seaborn
