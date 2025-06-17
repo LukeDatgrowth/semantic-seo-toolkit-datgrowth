@@ -6,3 +6,8 @@ scikit-learn
 matplotlib
 beautifulsoup4
 fpdf
+seaborn 
+io
+re
+TSNE
+cosine_similarity
