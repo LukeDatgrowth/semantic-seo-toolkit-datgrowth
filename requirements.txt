@@ -10,3 +10,4 @@ umap
 umap-learn
 sqlalchemy
 pymysql
+requests
