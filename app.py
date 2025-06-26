@@ -5,16 +5,18 @@ import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
 import re
 import openai
+import json
 from sklearn.manifold import TSNE
+from umap import UMAP
 from sklearn.metrics.pairwise import cosine_similarity
+from urllib.parse import urlparse
+from sqlalchemy import create_engine, text
 
 # === Prosta autoryzacja użytkowników ===
 def check_password():
     def password_entered():
-        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
-            st.session_state["password_correct"] = True
-        else:
-            st.session_state["password_correct"] = False
+        correct = st.session_state["password"] == st.secrets["APP_PASSWORD"]
+        st.session_state["password_correct"] = correct
 
     if "password_correct" not in st.session_state:
         st.text_input("🔐 Podaj hasło", type="password", on_change=password_entered, key="password")
@@ -24,16 +26,50 @@ def check_password():
         st.error("❌ Nieprawidłowe hasło")
         st.stop()
 
-# Uruchom logowanie przed całą aplikacją
+# Uruchom logowanie
 check_password()
 
-# === Ustawienia API ===
+# API Key i DB
 openai.api_key = st.secrets.get("OPENAI_API_KEY") or st.text_input("🔑 Podaj swój OpenAI API Key:", type="password")
 
-# === Ustawienia aplikacji ===
+# Konfiguracja połączenia z bazą danych
+# W pliku .streamlit/secrets.toml umieść:
+# MYSQL_USER = "twoj_user"
+# MYSQL_PASSWORD = "twoje_haslo"
+# MYSQL_HOST = "adres_hosta"
+# MYSQL_PORT = "3306"
+# MYSQL_DB = "nazwa_bazy"
+# Opcjonalnie: MYSQL_URI jeśli wolisz jednolinijkowy URI
+mysql_user = st.secrets["MYSQL_USER"]
+mysql_password = st.secrets["MYSQL_PASSWORD"]
+mysql_host = st.secrets["MYSQL_HOST"]
+mysql_port = st.secrets.get("MYSQL_PORT", "3306")
+mysql_db = st.secrets["MYSQL_DB"]
+
+# Budujemy URI SQLAlchemy
+mysql_uri = st.secrets.get(
+    "MYSQL_URI",
+    f"mysql+pymysql://{mysql_user}:{mysql_password}@{mysql_host}:{mysql_port}/{mysql_db}?charset=utf8mb4"
+)
+engine = create_engine(mysql_uri, pool_pre_ping=True)
+
+# Tworzenie tabeli, jeśli nie istnieje
+with engine.begin() as conn:
+    conn.execute(text(
+        """
+        CREATE TABLE IF NOT EXISTS embeddings (
+            domain VARCHAR(255),
+            url TEXT PRIMARY KEY,
+            content TEXT,
+            embedding LONGTEXT
+        )
+        """
+    ))
+
+# Konfiguracja strony
 st.set_page_config(page_title="Semantic SEO Toolkit", layout="wide")
 
-# === Sidebar ===
+# Sidebar nawigacja
 st.sidebar.title("🔎 Wybierz funkcję")
 view = st.sidebar.radio("Dostępne analizy:", [
     "📊 SiteRadius & SiteFocus",
@@ -44,297 +80,298 @@ view = st.sidebar.radio("Dostępne analizy:", [
     "⚔️ Porównanie z konkurencją"
 ])
 
-# === Wspólne funkcje ===
+# === Funkcje pomocnicze ===
+@st.cache_data(show_spinner=False)
 def clean_text(text):
     soup = BeautifulSoup(text, "html.parser")
-    text = soup.get_text(separator=" ")
-    text = re.sub(r"[*_~#>`]", "", text)
-    text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
-    text = re.sub(r"https?://\S+", "", text)
-    text = re.sub(r"[^\w\s.,!?-]", "", text)
-    return text.strip()
+    txt = soup.get_text(separator=" ")
+    txt = re.sub(r"[*_~#>`]", "", txt)
+    txt = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", txt)
+    txt = re.sub(r"https?://\S+", "", txt)
+    txt = re.sub(r"[^\w\s.,!?-]", "", txt)
+    return txt.lower().strip()
 
-def get_embedding(text):
-    response = openai.embeddings.create(
-        model="text-embedding-3-small",
-        input=text
-    )
-    return response.data[0].embedding
+# Pobiera lub tworzy embedding w DB MySQL
+def fetch_embedding(url, content):
+    domain = urlparse(url).netloc
+    cleaned = clean_text(content)
+    sel = text("SELECT content, embedding FROM embeddings WHERE url=:url")
+    # Używamy transakcji dla bezpieczeństwa
+    with engine.begin() as conn:
+        row = conn.execute(sel, {"url": url}).fetchone()
+        if row:
+            stored_content, stored_emb_json = row
+            if stored_content == cleaned:
+                return np.array(json.loads(stored_emb_json))
+        # jeżeli brak lub zmieniony content: pobierz nowe
+        response = openai.embeddings.create(model="text-embedding-3-small", input=cleaned)
+        emb = response.data[0].embedding
+        emb_json = json.dumps(emb)
+        # wstaw lub zaktualizuj (upsert)
+        upsert = text(
+            "INSERT INTO embeddings(domain,url,content,embedding) VALUES(:domain,:url,:content,:emb) "
+            "ON DUPLICATE KEY UPDATE content=:content, embedding=:emb"
+        )
+        conn.execute(upsert, {"domain": domain, "url": url, "content": cleaned, "emb": emb_json})
+        return np.array(emb)
 
+@st.cache_data(show_spinner=False)
 def compute_metrics(embeddings, custom_centroid=None):
-    sim_matrix = cosine_similarity(embeddings)
-    np.fill_diagonal(sim_matrix, np.nan)
-    site_focus = np.nanmean(sim_matrix)
+    sim = cosine_similarity(embeddings)
+    np.fill_diagonal(sim, np.nan)
+    focus = np.nanmean(sim)
     centroid = np.mean(embeddings, axis=0) if custom_centroid is None else custom_centroid
     dists = np.linalg.norm(embeddings - centroid, axis=1)
-    site_radius = np.max(dists)
-    return site_focus, site_radius, dists, centroid
-
+    radius = np.max(dists)
+    return focus, radius, dists, centroid
 # === Widoki ===
 if view == "📊 SiteRadius & SiteFocus":
     st.title("📊 SiteRadius & SiteFocus")
-    st.info("Tutaj możesz analizować rozrzut i spójność tematyczną treści jednej lub wielu domen.")
+    st.info("Analiza rozrzutu i spójności tematycznej.")
+    uploaded = st.file_uploader("📁 Wgraj CSV (URL, title, content)", type="csv")
+    topic = st.text_input("🎯 Temat główny (opcjonalnie)")
+    algo = st.selectbox("Algorytm redukcji wymiarów:", ['t-SNE', 'UMAP'])
+    perplexity = st.slider("Perplexity (tylko t-SNE):", 5, 50, 30) if algo == 't-SNE' else None
 
-    uploaded_file = st.file_uploader("📁 Wgraj plik CSV (kolumny: URL, title, content)", type="csv")
-    topic_input = st.text_input("🎯 (Opcjonalnie) Wprowadź temat główny strony lub bloga:")
+    if uploaded and openai.api_key:
+        df = pd.read_csv(uploaded)
+        df['clean'] = df['content'].astype(str)
+        # fetch embeddings with DB support
+        df['emb'] = df.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+        E = np.vstack(df['emb'].tolist())
+        C = fetch_embedding("", topic) if topic else None
+        focus, radius, dists, cent = compute_metrics(E, C)
 
-    if uploaded_file and openai.api_key:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
-        if not {'URL', 'title', 'content'}.issubset(df.columns):
-            st.error("⚠️ Plik musi zawierać kolumny: URL, title, content.")
+
+        # Redukcja wymiarów i wyznaczenie współrzędnych centrum
+        if cent is not None and algo == 't-SNE':
+            data = np.vstack([cent, E])
+            tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42)
+            coords_all = tsne.fit_transform(data)
+            center_point = coords_all[0]
+            coords = coords_all[1:]
         else:
-            df["clean_text"] = df["content"].astype(str).apply(clean_text)
-            df["embedding"] = df["clean_text"].apply(get_embedding)
-            embeddings = np.vstack(df["embedding"].tolist())
+            if algo == 'UMAP':
+                reducer = UMAP(n_components=2, random_state=42)
+                coords = reducer.fit_transform(E)
+                center_point = reducer.transform(np.array([cent]))[0] if cent is not None else None
+            else:
+                # TSNE without centroid
+                reducer = TSNE(n_components=2, perplexity=perplexity, random_state=42)
+                coords = reducer.fit_transform(E)
+                center_point = None
 
-            centroid_vector = get_embedding(topic_input) if topic_input else None
-            site_focus, site_radius, dists, centroid = compute_metrics(embeddings, centroid_vector)
+        df[['x', 'y']] = coords
+        df['dist'] = dists
 
-            tsne = TSNE(n_components=2, perplexity=5, random_state=42)
-            coords = tsne.fit_transform(embeddings)
+        st.metric("SiteFocus", f"{focus:.4f}")
+        st.metric("SiteRadius", f"{radius:.4f}")
 
-            df["x"] = coords[:, 0]
-            df["y"] = coords[:, 1]
-            df["dist_to_center"] = dists
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(df.x, df.y, s=50, alpha=0.8, edgecolor='k')
+        if center_point is not None:
+            ax.scatter(center_point[0], center_point[1], marker='X', s=200, label='Centrum tematyczne')
+        ax.set_title("Mapa tematyczna")
+        ax.legend()
+        st.pyplot(fig)
+        st.dataframe(df[['title', 'URL', 'dist']].sort_values('dist', ascending=False))
 
-            st.subheader("📈 Wyniki analizy")
-            st.metric("SiteFocus (spójność)", f"{site_focus:.4f}")
-            st.metric("SiteRadius (rozrzut)", f"{site_radius:.4f}")
-
-            fig, ax = plt.subplots(figsize=(10, 7))
-            ax.scatter(df["x"], df["y"], s=50, alpha=0.8, edgecolor='k')
-
-            tsne_centroid = TSNE(n_components=2, perplexity=5, random_state=42).fit_transform(np.vstack([centroid, embeddings]))
-            cx, cy = tsne_centroid[0]
-            ax.scatter(cx, cy, marker='X', s=200, color='blue', edgecolor='black', label="Centrum tematyczne")
-
-            ax.set_title("t-SNE mapa tematyczna")
-            ax.set_xlabel("x")
-            ax.set_ylabel("y")
-            ax.legend()
-            st.pyplot(fig)
-
-            st.subheader("🔍 Wpisy (z odległością od środka)")
-            st.dataframe(df[["title", "URL", "dist_to_center"]].sort_values("dist_to_center", ascending=False))
-
+# === Widok 2: Outliery tematyczne ===
 elif view == "📌 Outliery tematyczne":
-    st.title("📌 Wykrywanie outlierów")
-    st.info("Znajdź wpisy blogowe, które tematycznie odbiegają od reszty Twojej zawartości.")
+    st.title("📌 Outliery tematyczne")
+    st.info("Wykryj wpisy odstające tematycznie.")
+    uploaded = st.file_uploader("CSV (URL,title,content)", type="csv", key='o')
+    thr = st.slider("Threshold percentyl:", 50, 99, 95)
 
-    uploaded_file = st.file_uploader("📁 Wgraj plik CSV z wpisami (URL, title, content)", type="csv", key="outliers")
-    threshold = st.slider("📏 Próg odległości od środka (np. 95 percentyl):", 50, 99, 95)
+    if uploaded and openai.api_key:
+        df = pd.read_csv(uploaded)
+        df['clean'] = df['content'].apply(clean_text)
+        df['emb'] = df.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+        E = np.vstack(df['emb'].tolist())
+        _, _, dists, _ = compute_metrics(E)
+        df['dist'] = dists
 
-    if uploaded_file and openai.api_key:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
-        if not {'URL', 'title', 'content'}.issubset(df.columns):
-            st.error("⚠️ Plik musi zawierać kolumny: URL, title, content.")
-        else:
-            df["clean_text"] = df["content"].astype(str).apply(clean_text)
-            df["embedding"] = df["clean_text"].apply(get_embedding)
-            embeddings = np.vstack(df["embedding"].tolist())
+        perc = np.percentile(dists, thr)
+        outliers = df[df['dist'] > perc]
 
-            _, _, dists, centroid = compute_metrics(embeddings)
-            df["dist_to_center"] = dists
+        # Histogram rozkładu dystansów
+        fig, ax = plt.subplots()
+        ax.hist(dists, bins=30)
+        ax.axvline(perc, color='red', linestyle='--', label=f'{thr} percentyl')
+        ax.set_title('Rozkład dystansów do centroidu')
+        ax.legend()
+        st.pyplot(fig)
 
-            perc_val = np.percentile(dists, threshold)
-            outliers_df = df[df["dist_to_center"] > perc_val].sort_values("dist_to_center", ascending=False)
+        st.dataframe(outliers[['title', 'URL', 'dist']].sort_values('dist', ascending=False))
 
-            st.subheader(f"🚨 Wpisy uznane za outliery (>{threshold} percentyl)")
-            st.dataframe(outliers_df[["title", "URL", "dist_to_center"]])
-
+# === Widok 3: Linkowanie wewnętrzne ===
 elif view == "🔗 Linkowanie wewnętrzne":
     st.title("🔗 Semantyczne linkowanie wewnętrzne")
-    st.info("Generuj linki wewnętrzne między tematycznie najbliższymi wpisami.")
+    st.info("Generuj linki między tematycznie najbliższymi wpisami, wykluczając ten sam URL/domenę.")
+    uploaded = st.file_uploader("CSV (URL, title, content, opcjonalnie category)", type="csv", key='linking')
+    top_n = st.slider("Liczba sugerowanych linków na wpis:", 1, 5, 3)
 
-    uploaded_file = st.file_uploader("📁 Wgraj plik CSV z wpisami (URL, title, content)", type="csv", key="linking")
-    top_n_links = st.slider("🔗 Liczba sugerowanych linków na wpis:", 1, 5, 3)
+    if uploaded and openai.api_key:
+        df = pd.read_csv(uploaded)
+        df['clean'] = df['content'].apply(clean_text)
+        df['emb'] = df.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+        E = np.vstack(df['emb'].tolist())
 
-    if uploaded_file and openai.api_key:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
-        if not {'URL', 'title', 'content'}.issubset(df.columns):
-            st.error("⚠️ Plik musi zawierać kolumny: URL, title, content.")
-        else:
-            df["clean_text"] = df["content"].astype(str).apply(clean_text)
-            df["embedding"] = df["clean_text"].apply(get_embedding)
-            embeddings = np.vstack(df["embedding"].tolist())
+        sim = cosine_similarity(E)
+        np.fill_diagonal(sim, -np.inf)
+        domains = df['URL'].apply(lambda u: urlparse(u).netloc)
 
-            sim_matrix = cosine_similarity(embeddings)
-            np.fill_diagonal(sim_matrix, -np.inf)
+        suggestions = []
+        for i in range(len(df)):
+            mask = np.ones(len(df), dtype=bool)
+            mask[i] = False
+            mask &= domains != domains.iloc[i]
+            if 'category' in df.columns:
+                mask &= df['category'] != df.loc[i, 'category']
+            sims = sim[i].copy()
+            sims[~mask] = -np.inf
+            idx = np.argsort(sims)[::-1][:top_n]
+            suggestions.append([(df.iloc[j]['title'], df.iloc[j]['URL']) for j in idx])
 
-            suggestions = []
-            for i in range(len(df)):
-                similar_idx = np.argsort(sim_matrix[i])[::-1][:top_n_links]
-                suggested_links = [(df.iloc[j]["title"], df.iloc[j]["URL"]) for j in similar_idx]
-                suggestions.append(suggested_links)
+        df['link_suggestions'] = suggestions
+        for _, row in df.iterrows():
+            st.markdown(f"**{row['title']}**")
+            for t, u in row['link_suggestions']:
+                st.markdown(f"→ [{t}]({u})")
+            st.markdown('---')
 
-            df["link_suggestions"] = suggestions
-
-            st.subheader("🔗 Propozycje linkowania")
-            for _, row in df.iterrows():
-                st.markdown(f"**{row['title']}**  ")
-                for link_title, link_url in row["link_suggestions"]:
-                    st.markdown(f"→ [{link_title}]({link_url})")
-                st.markdown("---")
-
+# === Widok 4: Content Gap ===
 elif view == "🚧 Content Gap":
     st.title("🚧 Content Gap Analysis")
-    st.info("Porównaj swoją treść z konkurencją i wykryj luki tematyczne.")
+    st.info("Znajdź luki tematyczne względem konkurencji.")
 
-    user_file = st.file_uploader("📁 Wgraj swoją treść (CSV: URL, title, content)", type="csv", key="gap_user")
-    comp_file = st.file_uploader("📁 Wgraj treść konkurencji (CSV: URL, title, content)", type="csv", key="gap_comp")
-    similarity_threshold = st.slider("🎯 Próg podobieństwa (cosine)", 0.0, 1.0, 0.75, step=0.01)
+    user_file = st.file_uploader("Twoja treść (CSV: URL, title, content)", type="csv", key='gap_user')
+    comp_file = st.file_uploader("Treść konkurencji (CSV: URL, title, content)", type="csv", key='gap_comp')
+    threshold = st.slider("Próg podobieństwa (cosine):", 0.0, 1.0, 0.75, 0.01)
+    top_unique = st.number_input("Liczba najbardziej unikalnych wpisów (lowest similarity):", min_value=1, max_value=20, value=5)
 
     if user_file and comp_file and openai.api_key:
-        df_user = pd.read_csv(user_file, sep=None, engine="python")
-        df_comp = pd.read_csv(comp_file, sep=None, engine="python")
+        df_u = pd.read_csv(user_file)
+        df_c = pd.read_csv(comp_file)
 
-        if not {'URL', 'title', 'content'}.issubset(df_user.columns.union(df_comp.columns)):
-            st.error("⚠️ Oba pliki muszą zawierać kolumny: URL, title, content.")
-        else:
-            df_user["clean_text"] = df_user["content"].astype(str).apply(clean_text)
-            df_user["embedding"] = df_user["clean_text"].apply(get_embedding)
-            emb_user = np.vstack(df_user["embedding"].tolist())
+        # embeddingi
+        df_u['clean'] = df_u['content'].apply(clean_text)
+        df_u['emb'] = df_u.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+        U = np.vstack(df_u['emb'].tolist())
+        df_c['clean'] = df_c['content'].apply(clean_text)
+        df_c['emb'] = df_c.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+        C = np.vstack(df_c['emb'].tolist())
 
-            df_comp["clean_text"] = df_comp["content"].astype(str).apply(clean_text)
-            df_comp["embedding"] = df_comp["clean_text"].apply(get_embedding)
-            emb_comp = np.vstack(df_comp["embedding"].tolist())
+        sim = cosine_similarity(C, U)
+        df_c['max_sim'] = sim.max(axis=1)
 
-            sim_matrix = cosine_similarity(emb_comp, emb_user)
-            max_similarities = np.max(sim_matrix, axis=1)
-            df_comp["max_similarity"] = max_similarities
+        # luki poniżej progu
+        gaps = df_c[df_c['max_sim'] < threshold].sort_values('max_sim')
+        st.subheader("🚧 Wykryte luki poniżej progu")
+        st.dataframe(gaps[['title','URL','max_sim']])
 
-            gaps_df = df_comp[df_comp["max_similarity"] < similarity_threshold].sort_values("max_similarity")
+        # top unikalnych
+        unique = df_c.nsmallest(top_unique, 'max_sim')
+        st.subheader(f"🌟 Top {top_unique} najbardziej unikalnych wpisów")
+        st.dataframe(unique[['title','URL','max_sim']])
 
-            st.subheader("🚧 Wykryte luki tematyczne względem Twojej treści")
-            st.dataframe(gaps_df[["title", "URL", "max_similarity"]])
+        # podsumowanie GPT
+        prompt = (
+            "Podsumuj w kilku punktach kluczowe tematy, których brakuje mi na podstawie następujących tytułów konkurencji:\n" +
+            "\n".join(unique['title'].tolist())
+        )
+        resp = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role":"user","content": prompt}]
+        )
+        st.subheader("🔑 Podsumowanie braków tematycznych")
+        st.write(resp.choices[0].message.content)
 
+# === Widok 5: Monitoring w czasie ===
 elif view == "📈 Monitoring w czasie":
     st.title("📈 Monitoring tematyczny w czasie")
-    st.info("Obserwuj, jak zmienia się spójność i zakres tematyczny Twojej witryny w kolejnych okresach.")
+    st.info("Obserwuj zmiany SiteFocus/SiteRadius w kolejnych okresach.")
 
-    uploaded_files = st.file_uploader("📁 Wgraj pliki CSV z okresów (np. Q1.csv, Q2.csv...)", accept_multiple_files=True, type="csv")
+    files = st.file_uploader("CSV z okresów (np. Q1.csv, Q2.csv)", type="csv", accept_multiple_files=True)
+    if files and openai.api_key:
+        periods, f_vals, r_vals = [], [], []
+        for f in files:
+            df = pd.read_csv(f)
+            df['clean'] = df['content'].apply(clean_text)
+            df['emb'] = df.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+            E = np.vstack(df['emb'].tolist())
+            focus, radius, _, _ = compute_metrics(E)
+            periods.append(f.name)
+            f_vals.append(focus)
+            r_vals.append(radius)
 
-    if uploaded_files and openai.api_key:
-        focus_results = []
-        radius_results = []
-        periods = []
+        fig, ax = plt.subplots()
+        ax.plot(periods, f_vals, label='SiteFocus')
+        ax.plot(periods, r_vals, label='SiteRadius')
+        ax.set_xlabel('Okres')
+        ax.set_ylabel('Wartość')
+        ax.set_title('Monitoring tematyczny')
+        ax.legend()
+        st.pyplot(fig)
+        st.dataframe(pd.DataFrame({'Okres':periods,'SiteFocus':f_vals,'SiteRadius':r_vals}))
 
-        for file in uploaded_files:
-            df = pd.read_csv(file, sep=None, engine="python")
-            if not {'URL', 'title', 'content'}.issubset(df.columns):
-                st.warning(f"⚠️ Pominięto plik {file.name} — brak wymaganych kolumn.")
-                continue
-
-            df["clean_text"] = df["content"].astype(str).apply(clean_text)
-            df["embedding"] = df["clean_text"].apply(get_embedding)
-            embeddings = np.vstack(df["embedding"].tolist())
-
-            focus, radius, _, _ = compute_metrics(embeddings)
-            periods.append(file.name)
-            focus_results.append(focus)
-            radius_results.append(radius)
-
-        if focus_results:
-            result_df = pd.DataFrame({
-                "Okres": periods,
-                "SiteFocus": focus_results,
-                "SiteRadius": radius_results
-            })
-
-            st.subheader("📊 Zmiany wartości SiteFocus i SiteRadius")
-            st.line_chart(result_df.set_index("Okres"))
-            st.dataframe(result_df)
-
+# === Widok 6: Porównanie z konkurencją ===
 elif view == "⚔️ Porównanie z konkurencją":
     st.title("⚔️ Porównanie strategii treści")
-    st.info("Zobacz jak wypadasz na tle konkurencji pod względem spójności i rozrzutu tematycznego.")
+    st.info("Porównaj swoje wartości SiteFocus/SiteRadius z konkurencją.")
 
-    uploaded_files = st.file_uploader(
-        "📁 Wgraj pliki CSV (Twoja domena + konkurencja, z kolumną 'Domena')",
-        accept_multiple_files=True,
-        type="csv"
-    )
-
-    if uploaded_files and openai.api_key:
+    files = st.file_uploader("CSV-y (Twoja domena + konkurencja, z kolumną 'Domena')", type="csv", accept_multiple_files=True)
+    if files and openai.api_key:
         results = []
-
-        for file in uploaded_files:
-            df = pd.read_csv(file, sep=None, engine="python")
-            if not {'URL', 'title', 'content', 'Domena'}.issubset(df.columns):
-                st.warning(f"⚠️ Pominięto plik {file.name} — brak wymaganych kolumn.")
+        for f in files:
+            df = pd.read_csv(f)
+            if not {'URL','title','content','Domena'}.issubset(df.columns):
+                st.warning(f"Pominięto {f.name} – brak kolumn.")
                 continue
-
-            for domain_name, group in df.groupby("Domena"):
-                group["clean_text"] = group["content"].astype(str).apply(clean_text)
-                group["embedding"] = group["clean_text"].apply(get_embedding)
-                embeddings = np.vstack(group["embedding"].tolist())
-                focus, radius, _, _ = compute_metrics(embeddings)
-                results.append({"Domena": domain_name, "SiteFocus": focus, "SiteRadius": radius})
-
+            for dom, grp in df.groupby('Domena'):
+                grp['clean'] = grp['content'].apply(clean_text)
+                grp['emb'] = grp.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+                E = np.vstack(grp['emb'].tolist())
+                focus, radius, _, _ = compute_metrics(E)
+                results.append({'Domena':dom,'SiteFocus':focus,'SiteRadius':radius})
         if results:
-            results_df = pd.DataFrame(results).sort_values("SiteFocus", ascending=False)
+            res_df = pd.DataFrame(results)
+            res_df = res_df.sort_values('SiteFocus', ascending=False)
 
-            st.subheader("📋 Porównanie domen")
+            sel = st.multiselect("Wybierz domeny:", res_df['Domena'].unique(), default=res_df['Domena'].tolist())
+            r1 = st.slider("Zakres SiteFocus:", float(res_df['SiteFocus'].min()), float(res_df['SiteFocus'].max()), (float(res_df['SiteFocus'].min()), float(res_df['SiteFocus'].max())))
+            r2 = st.slider("Zakres SiteRadius:", float(res_df['SiteRadius'].min()), float(res_df['SiteRadius'].max()), (float(res_df['SiteRadius'].min()), float(res_df['SiteRadius'].max())))
+            filt = res_df[res_df['Domena'].isin(sel) & res_df['SiteFocus'].between(*r1) & res_df['SiteRadius'].between(*r2)]
+            st.dataframe(filt)
 
-            # Filtry interaktywne
-            selected_domains = st.multiselect("🔎 Wybierz domeny do porównania:", options=results_df["Domena"].unique(), default=list(results_df["Domena"].unique()))
-            focus_range = st.slider("🎯 Zakres SiteFocus:", float(results_df["SiteFocus"].min()), float(results_df["SiteFocus"].max()), (float(results_df["SiteFocus"].min()), float(results_df["SiteFocus"].max())))
-            radius_range = st.slider("📐 Zakres SiteRadius:", float(results_df["SiteRadius"].min()), float(results_df["SiteRadius"].max()), (float(results_df["SiteRadius"].min()), float(results_df["SiteRadius"].max())))
-
-            filtered_df = results_df[
-                (results_df["Domena"].isin(selected_domains)) &
-                (results_df["SiteFocus"].between(*focus_range)) &
-                (results_df["SiteRadius"].between(*radius_range))
-            ]
-
-            st.dataframe(filtered_df)
-
-            import matplotlib.pyplot as plt
-            import seaborn as sns
-
-            fig, ax = plt.subplots(figsize=(10, 5))
-            bar_width = 0.35
-            x = np.arange(len(filtered_df))
-
-            ax.bar(x - bar_width/2, filtered_df["SiteFocus"], width=bar_width, label="SiteFocus", color="#1f77b4")
-            ax.bar(x + bar_width/2, filtered_df["SiteRadius"], width=bar_width, label="SiteRadius", color="#aec7e8")
-
+            fig, ax = plt.subplots(figsize=(10,5))
+            x = np.arange(len(filt))
+            ax.bar(x-0.2, filt['SiteFocus'], width=0.4, label='SiteFocus')
+            ax.bar(x+0.2, filt['SiteRadius'], width=0.4, label='SiteRadius')
             ax.set_xticks(x)
-            ax.set_xticklabels(filtered_df["Domena"], rotation=45, ha="right")
-            ax.set_ylabel("Wartości")
-            ax.set_title("Porównanie SiteFocus i SiteRadius")
+            ax.set_xticklabels(filt['Domena'], rotation=45, ha='right')
+            ax.set_ylabel('Wartość')
+            ax.set_title('Porównanie domen')
             ax.legend()
             st.pyplot(fig)
 
-            st.download_button(
-                label="⬇️ Pobierz dane jako CSV",
-                data=filtered_df.to_csv(index=False).encode('utf-8'),
-                file_name="porownanie_domen.csv",
-                mime="text/csv"
-            )
+            # Eksport CSV
+            st.download_button('⬇️ Pobierz CSV', filt.to_csv(index=False).encode('utf-8'), 'porownanie.csv','text/csv')
 
-            export_pdf = st.checkbox("📄 Wygeneruj PDF (eksperymentalne)")
-            if export_pdf:
+            # Eksport PDF
+            if st.checkbox('📄 Generuj PDF'): 
                 import io
                 from fpdf import FPDF
-
-                pdf_buf = io.BytesIO()
-                fig.savefig(pdf_buf, format="png")
-                pdf_buf.seek(0)
-
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png')
+                buf.seek(0)
                 pdf = FPDF()
                 pdf.add_page()
-                pdf.set_font("Arial", size=12)
-                pdf.cell(200, 10, txt="Porównanie domen - Semantic SEO", ln=True, align="C")
-                pdf.image(pdf_buf, x=10, y=30, w=180)
-
-                pdf_output = io.BytesIO()
-                pdf.output(pdf_output)
-                pdf_output.seek(0)
-
-                st.download_button(
-                    label="📥 Pobierz PDF",
-                    data=pdf_output,
-                    file_name="porownanie_domen.pdf",
-                    mime="application/pdf"
-                )
+                pdf.set_font('Arial', size=12)
+                pdf.cell(200,10, txt='Porównanie domen - Semantic SEO', ln=True, align='C')
+                pdf.image(buf, x=10, y=30, w=180)
+                outbuf = io.BytesIO()
+                pdf.output(outbuf)
+                outbuf.seek(0)
+                st.download_button('📥 Pobierz PDF', outbuf, 'porownanie.pdf', 'application/pdf')
+                st.success('PDF wygenerowano pomyślnie!')
