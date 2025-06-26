@@ -1,9 +1,12 @@
 streamlit
+openai
 pandas
 numpy
+scikit-learn
 matplotlib
 beautifulsoup4
-openai
-scikit-learn
 fpdf
-seaborn
+umap
+umap-learn
+sqlalchemy
+pymysql
