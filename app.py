@@ -11,14 +11,19 @@ from umap import UMAP
 from sklearn.metrics.pairwise import cosine_similarity
 from urllib.parse import urlparse
 from sqlalchemy import create_engine, text
+import requests
+
 
 # === Prosta autoryzacja użytkowników ===
 def check_password():
     def password_entered():
         correct = st.session_state["password"] == st.secrets["APP_PASSWORD"]
         st.session_state["password_correct"] = correct
-
+       
+        
     if "password_correct" not in st.session_state:
+        ip = requests.get('https://ifconfig.me/ip', timeout=5).text.strip()
+        st.header(ip, divider=True)
         st.text_input("🔐 Podaj hasło", type="password", on_change=password_entered, key="password")
         st.stop()
     elif not st.session_state["password_correct"]:
