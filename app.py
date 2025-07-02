@@ -82,7 +82,9 @@ view = st.sidebar.radio("Dostępne analizy:", [
     "🔗 Linkowanie wewnętrzne",
     "🚧 Content Gap",
     "📈 Monitoring w czasie",
-    "⚔️ Porównanie z konkurencją"
+    "⚔️ Porównanie z konkurencją",
+    "➕ Dodawanie nowych artykułów",
+    "🔀 Decyzja o łączeniu stron"
 ])
 
 # === Funkcje pomocnicze ===
@@ -380,3 +382,114 @@ elif view == "⚔️ Porównanie z konkurencją":
                 outbuf.seek(0)
                 st.download_button('📥 Pobierz PDF', outbuf, 'porownanie.pdf', 'application/pdf')
                 st.success('PDF wygenerowano pomyślnie!')
+# === Widok 7: Dodawanie nowych artykułów ===
+elif view == "➕ Dodawanie nowych artykułów":
+    st.title("➕ Dodawanie nowych artykułów")
+    st.info("Symulacja wpływu nowych treści na SiteFocus i SiteRadius")
+
+    old_file = st.file_uploader("📁 Istniejące treści (CSV: URL, title, content)", type="csv", key="existing")
+    new_file = st.file_uploader("📁 Propozycje nowych treści (CSV: URL, title, content)", type="csv", key="new")
+    show_table = st.checkbox("📄 Pokaż porównanie tematyczne", value=True)
+
+    if old_file and new_file and openai.api_key:
+        df_old = pd.read_csv(old_file)
+        df_new = pd.read_csv(new_file)
+
+        for df in [df_old, df_new]:
+            df['clean'] = df['content'].apply(clean_text)
+            df['emb'] = df.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+
+        E_old = np.vstack(df_old['emb'].tolist())
+        E_new = np.vstack(df_new['emb'].tolist())
+        E_combined = np.vstack([E_old, E_new])
+
+        focus_old, radius_old, _, _ = compute_metrics(E_old)
+        focus_new, radius_new, _, _ = compute_metrics(E_new)
+        focus_comb, radius_comb, _, _ = compute_metrics(E_combined)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("🔹 Obecny SiteFocus", f"{focus_old:.4f}")
+            st.metric("🔹 Obecny SiteRadius", f"{radius_old:.4f}")
+        with col2:
+            st.metric("🆕 SiteFocus (nowe)", f"{focus_new:.4f}")
+            st.metric("🆕 SiteRadius (nowe)", f"{radius_new:.4f}")
+        with col3:
+            st.metric("🧠 Po dodaniu - SiteFocus", f"{focus_comb:.4f}")
+            st.metric("🧠 Po dodaniu - SiteRadius", f"{radius_comb:.4f}")
+
+        # Ocena zmiany
+        delta_focus = focus_comb - focus_old
+        delta_radius = radius_comb - radius_old
+
+        with st.expander("📊 Interpretacja zmian"):
+            if delta_focus > 0 and delta_radius > 0:
+                st.success("✅ Dodanie nowych treści zwiększa zarówno spójność, jak i zasięg tematyczny.")
+            elif delta_focus > 0:
+                st.info("ℹ️ Dodanie nowych treści poprawia spójność, ale nie poszerza tematyki.")
+            elif delta_radius > 0:
+                st.info("⚠️ Dodanie nowych treści poszerza tematykę, ale może rozmywać fokus.")
+            else:
+                st.warning("❌ Nowe treści nie poprawiają SiteFocus ani SiteRadius. Warto przeanalizować ich trafność.")
+
+        if show_table:
+            df_new['similarity_to_old'] = cosine_similarity(E_new, E_old).max(axis=1)
+            df_new['distance_to_old_centroid'] = np.linalg.norm(E_new - np.mean(E_old, axis=0), axis=1)
+            st.markdown("### 📄 Nowe artykuły z najmniejszym podobieństwem do obecnych")
+            st.dataframe(df_new.sort_values("similarity_to_old")[['title', 'URL', 'similarity_to_old', 'distance_to_old_centroid']])
+            # === Widok 8: Decyzja o łączeniu stron ===
+elif view == "🔀 Decyzja o łączeniu stron":
+    st.title("🔀 Analiza decyzji o łączeniu treści")
+    st.info("Porównaj SiteFocus i podobieństwo semantyczne, aby ocenić czy warto połączyć artykuły.")
+
+    merge_file = st.file_uploader("📁 Wgraj plik CSV z minimum 2 stronami do porównania (URL, title, content)", type="csv", key="merge")
+    use_db = st.checkbox("🗄️ Wybierz artykuły z bazy danych")
+
+    if use_db:
+        with engine.begin() as conn:
+            result = conn.execute(text("SELECT url, content FROM embeddings LIMIT 100")).fetchall()
+            db_df = pd.DataFrame(result, columns=["URL", "content"])
+            selected_urls = st.multiselect("🔍 Wybierz URL-e do analizy:", db_df["URL"].tolist())
+            df = db_df[db_df["URL"].isin(selected_urls)].copy()
+            df['title'] = df['URL']
+    elif merge_file:
+        df = pd.read_csv(merge_file)
+
+    if 'df' in locals() and not df.empty and openai.api_key:
+        if len(df) < 2:
+            st.warning("Wymagane co najmniej dwa artykuły do porównania.")
+        else:
+            df['clean'] = df['content'].apply(clean_text)
+            df['emb'] = df.apply(lambda row: fetch_embedding(row['URL'], row['clean']), axis=1)
+
+            E = np.vstack(df['emb'].tolist())
+
+            # Metryki indywidualne
+            site_focus_list = []
+            for i, emb in enumerate(df['emb']):
+                single_focus, _, _, _ = compute_metrics(np.vstack([emb for j, emb in enumerate(df['emb']) if j != i]))
+                site_focus_list.append(single_focus)
+            df['site_focus_individual'] = site_focus_list
+
+            # Cosine similarity pomiędzy wszystkimi
+            sim_matrix = cosine_similarity(E)
+            np.fill_diagonal(sim_matrix, np.nan)
+            df['max_similarity_to_others'] = np.nanmax(sim_matrix, axis=1)
+
+            # Połączenie i ocena wspólna
+            focus_combined, _, _, _ = compute_metrics(E)
+
+            st.metric("📊 Średni SiteFocus osobno", f"{np.mean(site_focus_list):.4f}")
+            st.metric("🔗 SiteFocus po połączeniu", f"{focus_combined:.4f}")
+
+            delta = focus_combined - np.mean(site_focus_list)
+            with st.expander("🧠 Rekomendacja"):
+                if delta > 0.02:
+                    st.success("✅ Połączenie zwiększa spójność tematyczną. Warto połączyć treści.")
+                elif delta > -0.01:
+                    st.info("ℹ️ Spójność pozostaje na podobnym poziomie. Decyzja zależna od strategii.")
+                else:
+                    st.warning("❌ Połączenie może obniżyć SiteFocus. Rozważ zostawienie osobno.")
+
+            st.markdown("### 🔍 Szczegóły artykułów")
+            st.dataframe(df[['title', 'URL', 'site_focus_individual', 'max_similarity_to_others']].sort_values('site_focus_individual'))
